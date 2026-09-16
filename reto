@@ -1,0 +1,1298 @@
+# ============================================================
+# Output folder
+# ============================================================
+
+outpathcount <- "/Users/pame/r studio/reto/"
+
+dir.create(outpathcount, showWarnings = FALSE)
+
+
+# ============================================================
+# Install / load libraries
+# ============================================================
+
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+cran_pkgs <- c(
+  "ggplot2",
+  "BiocManager",
+  "pheatmap",
+  "VennDiagram",
+  "UpSetR"
+)
+
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+bioc_pkgs <- c(
+  "edgeR",
+  "limma",
+  "DESeq2",
+  "GO.db",
+  "AnnotationDbi"
+)
+
+for (pkg in bioc_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg)
+  }
+}
+
+library(DESeq2)
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(GO.db)
+library(AnnotationDbi)
+library(pheatmap)
+library(VennDiagram)
+library(UpSetR)
+
+
+# ============================================================
+# Read counts and metadata
+# ============================================================
+
+counts <- read.table(
+  "Matrix_hisat2.txt",
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  check.names = FALSE
+)
+
+metadata <- read.table(
+  "metadata.txt",
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+# Make sure sample names match
+if (!all(metadata$sample %in% colnames(counts))) {
+  stop("Some samples in metadata are not present in the counts matrix.")
+}
+
+counts <- counts[, match(metadata$sample, colnames(counts))]
+counts <- round(counts)
+
+
+# ============================================================
+# Read annotation
+# ============================================================
+
+annotation <- read.table(
+  "fullAnnotation.txt",
+  header = TRUE,
+  sep = "\t",
+  quote = "\"",
+  comment.char = "",
+  fill = TRUE,
+  stringsAsFactors = FALSE,
+  na.strings = c("-", "NA", "")
+)
+
+
+# ============================================================
+# Create gene -> GO mapping
+# ============================================================
+
+has_go <- !is.na(annotation$GOs)
+
+gene2go <- strsplit(
+  annotation$GOs[has_go],
+  ","
+)
+
+# IMPORTANT:
+# Counts match annotation$gene_id, not annotation$ID
+names(gene2go) <- annotation$gene_id[has_go]
+
+gene2go <- lapply(
+  gene2go,
+  trimws
+)
+
+# Create GO term -> gene mapping
+
+term2gene <- split(
+  rep(
+    names(gene2go),
+    lengths(gene2go)
+  ),
+  unlist(gene2go)
+)
+
+length(gene2go)
+length(term2gene)
+
+min_set_size <- 5
+
+
+# ============================================================
+# CAMERA analysis per cultivar
+# ============================================================
+
+cultivars <- c(
+  "Catuai",
+  "CR95"
+)
+
+camera_results <- list()
+
+voom_objects <- list()
+
+
+for (cv in cultivars) {
+
+  cat(
+    "=== Running CAMERA for",
+    cv,
+    "===\n"
+  )
+
+  # Select samples from current cultivar
+
+  metadata_cv <- metadata[
+    metadata$cultivar == cv,
+  ]
+
+  counts_cv <- counts[
+    ,
+    metadata_cv$sample,
+    drop = FALSE
+  ]
+
+  # Treatment
+
+  treatment <- factor(
+    metadata_cv$treatment,
+    levels = c(
+      "saline",
+      "xylella"
+    )
+  )
+
+  # DGEList
+
+  dge <- DGEList(
+    counts = counts_cv,
+    group = treatment
+  )
+
+  # Filter low-expression genes
+
+  keep <- filterByExpr(
+    dge,
+    group = treatment
+  )
+
+  dge <- dge[
+    keep,
+    ,
+    keep.lib.sizes = FALSE
+  ]
+
+  # Normalize
+
+  dge <- calcNormFactors(dge)
+
+  # Design
+
+  design <- model.matrix(
+    ~ treatment
+  )
+
+  # Voom
+
+  v <- voom(
+    dge,
+    design,
+    plot = FALSE
+  )
+
+  voom_objects[[cv]] <- v
+
+  # Restrict GO sets to genes present
+  # in filtered expression data
+
+  term2gene_cv <- lapply(
+    term2gene,
+    function(g) {
+      intersect(
+        g,
+        rownames(v$E)
+      )
+    }
+  )
+
+  # Keep GO terms with >= 5 genes
+
+  term2gene_cv <- term2gene_cv[
+    lengths(term2gene_cv) >= min_set_size
+  ]
+
+  cat(
+    "GO terms available for",
+    cv,
+    ":",
+    length(term2gene_cv),
+    "\n"
+  )
+
+  if (length(term2gene_cv) == 0) {
+
+    warning(
+      "No GO terms available for ",
+      cv
+    )
+
+    next
+  }
+
+  # Convert GO sets to row indices
+
+  idx <- lapply(
+    term2gene_cv,
+    function(g) {
+      match(
+        g,
+        rownames(v$E)
+      )
+    }
+  )
+
+  # CAMERA
+
+  res <- camera(
+    v,
+    index = idx,
+    design = design,
+    contrast = 2
+  )
+
+  res$GOID <- rownames(res)
+
+  # GO information
+
+  term_info <- suppressMessages(
+    AnnotationDbi::select(
+      GO.db,
+      keys = res$GOID,
+      columns = c(
+        "TERM",
+        "ONTOLOGY"
+      ),
+      keytype = "GOID"
+    )
+  )
+
+  res <- merge(
+    res,
+    term_info,
+    by = "GOID",
+    all.x = TRUE
+  )
+
+  res$TERM[
+    is.na(res$TERM)
+  ] <- res$GOID[
+    is.na(res$TERM)
+  ]
+
+  res$ONTOLOGY[
+    is.na(res$ONTOLOGY)
+  ] <- "Unknown"
+
+  res <- res[
+    order(res$PValue),
+  ]
+
+  camera_results[[cv]] <- res
+
+  # Save CAMERA results
+
+  write.table(
+    res,
+    file = paste0(
+      outpathcount,
+      "CAMERA_",
+      cv,
+      ".txt"
+    ),
+    row.names = FALSE,
+    col.names = TRUE,
+    quote = FALSE,
+    sep = "\t"
+  )
+}
+
+
+# ============================================================
+# Significant CAMERA results
+# ============================================================
+
+sig_cutoff <- 0.05
+
+sig_results <- lapply(
+  camera_results,
+  function(res) {
+    res[
+      !is.na(res$FDR) &
+        res$FDR < sig_cutoff,
+      ,
+      drop = FALSE
+    ]
+  }
+)
+
+sapply(
+  sig_results,
+  nrow
+)
+
+
+# ============================================================
+# CAMERA barplots
+# ============================================================
+
+plot_camera_barplot <- function(
+    res,
+    title,
+    top_n = 15
+) {
+
+  if (nrow(res) == 0) {
+
+    cat(
+      "No significant GO terms for",
+      title,
+      "-- skipping plot.\n"
+    )
+
+    return(
+      invisible(NULL)
+    )
+  }
+
+  res_top <- head(
+    res[
+      order(res$FDR),
+    ],
+    top_n
+  )
+
+  res_top$TERM <- factor(
+    res_top$TERM,
+    levels = rev(res_top$TERM)
+  )
+
+  p <- ggplot(
+    res_top,
+    aes(
+      x = TERM,
+      y = -log10(FDR),
+      fill = Direction
+    )
+  ) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(
+      values = c(
+        Up = "firebrick",
+        Down = "steelblue"
+      )
+    ) +
+    labs(
+      title = title,
+      x = "GO term",
+      y = "-log10(FDR)"
+    ) +
+    theme_bw()
+
+  print(p)
+
+  ggsave(
+    paste0(
+      outpathcount,
+      "barplot_",
+      title,
+      ".pdf"
+    ),
+    p,
+    width = 8,
+    height = 6
+  )
+}
+
+
+for (cv in names(sig_results)) {
+
+  plot_camera_barplot(
+    sig_results[[cv]],
+    cv
+  )
+}
+
+
+# ============================================================
+# DESeq2 separately for each cultivar
+# ============================================================
+
+deseq_results <- list()
+
+for (cv in cultivars) {
+
+  cat("\n========================================\n")
+  cat("Running DESeq2 for:", cv, "\n")
+  cat("========================================\n")
+
+  # ----------------------------------------------------------
+  # Select samples from cultivar
+  # ----------------------------------------------------------
+
+  metadata_cv <- metadata[
+    metadata$cultivar == cv,
+    ,
+    drop = FALSE
+  ]
+
+  cat(
+    "Samples:",
+    paste(metadata_cv$sample, collapse = ", "),
+    "\n"
+  )
+
+  # ----------------------------------------------------------
+  # Counts
+  # ----------------------------------------------------------
+
+  counts_cv <- counts[
+    ,
+    metadata_cv$sample,
+    drop = FALSE
+  ]
+
+  # ----------------------------------------------------------
+  # Treatment
+  # ----------------------------------------------------------
+
+  metadata_cv$treatment <- factor(
+    metadata_cv$treatment,
+    levels = c(
+      "saline",
+      "xylella"
+    )
+  )
+
+  print(table(metadata_cv$treatment))
+
+  # ----------------------------------------------------------
+  # Remove genes with zero counts in all samples
+  # ----------------------------------------------------------
+
+  counts_cv <- counts_cv[
+    rowSums(counts_cv) > 0,
+    ,
+    drop = FALSE
+  ]
+
+  # ----------------------------------------------------------
+  # DESeq2 object
+  # ----------------------------------------------------------
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = counts_cv,
+    colData = metadata_cv,
+    design = ~ treatment
+  )
+
+  dds <- DESeq(dds)
+
+  # ----------------------------------------------------------
+  # Xylella vs saline
+  # ----------------------------------------------------------
+
+  res <- results(
+    dds,
+    contrast = c(
+      "treatment",
+      "xylella",
+      "saline"
+    )
+  )
+
+  res <- as.data.frame(res)
+
+  res <- res[
+    order(res$padj),
+    ,
+    drop = FALSE
+  ]
+
+  deseq_results[[cv]] <- res
+
+  cat(
+    "Genes analyzed:",
+    nrow(res),
+    "\n"
+  )
+
+  cat(
+    "Significant genes FDR < 0.05:",
+    sum(
+      !is.na(res$padj) &
+        res$padj < 0.05
+    ),
+    "\n"
+  )
+
+  # ----------------------------------------------------------
+  # Save complete results
+  # ----------------------------------------------------------
+
+  write.table(
+    res,
+    file = paste0(
+      outpathcount,
+      "DESeq2_",
+      cv,
+      ".txt"
+    ),
+    sep = "\t",
+    row.names = TRUE,
+    col.names = NA,
+    quote = FALSE
+  )
+
+  # ----------------------------------------------------------
+  # Significant genes: FDR < 0.05 AND |log2FC| >= 1
+  # ----------------------------------------------------------
+
+  sig <- res[
+    !is.na(res$padj) &
+      res$padj < 0.05 &
+      !is.na(res$log2FoldChange) &
+      abs(res$log2FoldChange) >= 1,
+    ,
+    drop = FALSE
+  ]
+
+  write.table(
+    sig,
+    file = paste0(
+      outpathcount,
+      "DESeq2_sig_",
+      cv,
+      ".txt"
+    ),
+    sep = "\t",
+    row.names = TRUE,
+    col.names = NA,
+    quote = FALSE
+  )
+
+  cat(
+    "Significant genes FDR < 0.05 and |log2FC| >= 1:",
+    nrow(sig),
+    "\n"
+  )
+
+  # ----------------------------------------------------------
+  # Save the DESeqDataSet too, needed later for the heatmap
+  # ----------------------------------------------------------
+
+  assign(paste0("dds_", cv), dds)
+}
+
+
+# ============================================================
+# Check final DESeq2 results
+# ============================================================
+
+cat("\n========================================\n")
+cat("DESeq2 results stored:\n")
+cat("========================================\n")
+
+print(names(deseq_results))
+
+cat("\nCatuai:\n")
+print(class(deseq_results[["Catuai"]]))
+print(dim(deseq_results[["Catuai"]]))
+
+cat("\nCR95:\n")
+print(class(deseq_results[["CR95"]]))
+print(dim(deseq_results[["CR95"]]))
+
+
+
+# ============================================================
+# Heatmaps (per cultivar)
+# ============================================================
+
+plot_heatmap <- function(
+    cv,
+    top_n = 50
+) {
+
+  metadata_cv <- metadata[
+    metadata$cultivar == cv,
+  ]
+
+  metadata_cv$treatment <- factor(
+    metadata_cv$treatment,
+    levels = c(
+      "saline",
+      "xylella"
+    )
+  )
+
+  counts_cv <- counts[
+    ,
+    metadata_cv$sample,
+    drop = FALSE
+  ]
+
+  res <- as.data.frame(
+    deseq_results[[cv]]
+  )
+
+  sig <- res[
+    !is.na(res$padj) &
+      res$padj < 0.05 &
+      abs(res$log2FoldChange) >= 1,
+  ]
+
+  sig <- sig[
+    order(sig$padj),
+  ]
+
+  if (nrow(sig) == 0) {
+    cat(
+      "No significant genes for",
+      cv,
+      "\n"
+    )
+    return()
+  }
+
+  genes <- rownames(sig)[
+    1:min(
+      top_n,
+      nrow(sig)
+    )
+  ]
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = counts_cv,
+    colData = metadata_cv,
+    design = ~ treatment
+  )
+
+  dds <- estimateSizeFactors(dds)
+
+  vsd <- vst(
+    dds,
+    blind = FALSE
+  )
+
+  mat <- assay(vsd)[
+    genes,
+    ,
+    drop = FALSE
+  ]
+
+  mat <- t(
+    scale(
+      t(mat)
+    )
+  )
+
+  annotation_col <- data.frame(
+    Treatment = metadata_cv$treatment
+  )
+
+  rownames(annotation_col) <- metadata_cv$sample
+
+  colnames(mat) <- metadata_cv$sample
+
+  pdf(
+    paste0(
+      outpathcount,
+      "Heatmap_",
+      cv,
+      ".pdf"
+    ),
+    width = 9,
+    height = 10
+  )
+
+  pheatmap(
+    mat,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    show_rownames = TRUE,
+    annotation_col = annotation_col,
+    main = paste(
+      "Top DE genes -",
+      cv
+    ),
+    fontsize_row = 7
+  )
+
+  dev.off()
+
+  cat(
+    "Heatmap saved for",
+    cv,
+    "-",
+    length(genes),
+    "genes\n"
+  )
+}
+
+plot_heatmap(
+  "Catuai",
+  top_n = 50
+)
+
+plot_heatmap(
+  "CR95",
+  top_n = 50
+)
+
+
+# ============================================================
+# Significant gene lists - Catuai vs CR95
+# ============================================================
+
+get_sig_genes <- function(res) {
+
+  res <- as.data.frame(res)
+
+  genes <- rownames(res)[
+    !is.na(res$padj) &
+      res$padj < 0.05 &
+      abs(res$log2FoldChange) >= 1
+  ]
+
+  return(genes)
+}
+
+genes_Catuai <- get_sig_genes(deseq_results[["Catuai"]])
+genes_CR95 <- get_sig_genes(deseq_results[["CR95"]])
+
+cat(
+  "Significant genes - Catuai:",
+  length(genes_Catuai),
+  "\n"
+)
+
+cat(
+  "Significant genes - CR95:",
+  length(genes_CR95),
+  "\n"
+)
+
+write.table(
+  genes_Catuai,
+  file = paste0(
+    outpathcount,
+    "SigGenes_Catuai.txt"
+  ),
+  row.names = FALSE,
+  col.names = "Gene",
+  quote = FALSE
+)
+
+write.table(
+  genes_CR95,
+  file = paste0(
+    outpathcount,
+    "SigGenes_CR95.txt"
+  ),
+  row.names = FALSE,
+  col.names = "Gene",
+  quote = FALSE
+)
+
+
+# ============================================================
+# Venn diagram - Catuai vs CR95
+# ============================================================
+
+venn_Catuai_CR95 <- venn.diagram(
+  x = list(
+    Catuai = genes_Catuai,
+    CR95 = genes_CR95
+  ),
+  filename = NULL,
+  fill = c(
+    "firebrick",
+    "steelblue"
+  ),
+  alpha = 0.5,
+  cex = 1.5,
+  cat.cex = 1.3,
+  cat.pos = c(-20, 20),
+  margin = 0.1,
+  main = "Significant genes - Catuai vs CR95",
+  main.cex = 1.5
+)
+
+pdf(
+  paste0(
+    outpathcount,
+    "Venn_Catuai_CR95.pdf"
+  ),
+  width = 7,
+  height = 7
+)
+
+grid::grid.draw(
+  venn_Catuai_CR95
+)
+
+dev.off()
+
+
+# ============================================================
+# UpSet plot - Catuai vs CR95
+# ============================================================
+
+upset_Catuai_CR95 <- fromList(
+  list(
+    Catuai = genes_Catuai,
+    CR95 = genes_CR95
+  )
+)
+
+pdf(
+  paste0(
+    outpathcount,
+    "UpSet_Catuai_CR95.pdf"
+  ),
+  width = 8,
+  height = 6
+)
+
+upset(
+  upset_Catuai_CR95,
+  sets = c(
+    "Catuai",
+    "CR95"
+  ),
+  order.by = "freq",
+  mainbar.y.label = "Number of genes",
+  sets.x.label = "Significant genes",
+  text.scale = 1.3
+)
+
+dev.off()
+
+
+# ------------------------------------------------------------
+# UpSet con direccion (Up / Down) para Catuai y CR95
+# ------------------------------------------------------------
+
+get_sig_genes_direction <- function(res, padj_cutoff = 0.05, lfc_cutoff = 0) {
+  df <- as.data.frame(res)
+  list(
+    Up = rownames(df)[!is.na(df$padj) & df$padj < padj_cutoff & df$log2FoldChange >= lfc_cutoff],
+    Down = rownames(df)[!is.na(df$padj) & df$padj < padj_cutoff & df$log2FoldChange <= -lfc_cutoff]
+  )
+}
+
+dir_Catuai <- get_sig_genes_direction(deseq_results[["Catuai"]])
+dir_CR95 <- get_sig_genes_direction(deseq_results[["CR95"]])
+
+cat("Catuai - Up:", length(dir_Catuai$Up), "| Down:", length(dir_Catuai$Down), "\n")
+cat("CR95   - Up:", length(dir_CR95$Up), "| Down:", length(dir_CR95$Down), "\n")
+
+updown_lists <- list(
+  Catuai_Up = dir_Catuai$Up,
+  Catuai_Down = dir_Catuai$Down,
+  CR95_Up = dir_CR95$Up,
+  CR95_Down = dir_CR95$Down
+)
+
+for (name in names(updown_lists)) {
+  write.table(
+    updown_lists[[name]],
+    file = paste0(outpathcount, "SigGenes_", name, ".txt"),
+    row.names = FALSE, col.names = "Gene", quote = FALSE
+  )
+}
+
+upset_updown <- fromList(updown_lists)
+
+pdf(paste0(outpathcount, "UpSet_Catuai_CR95_UpDown.pdf"), width = 10, height = 7)
+upset(
+  upset_updown,
+  sets = c("Catuai_Up", "Catuai_Down", "CR95_Up", "CR95_Down"),
+  keep.order = TRUE,
+  order.by = "freq",
+  mainbar.y.label = "Number of genes",
+  sets.x.label = "Significant genes",
+  text.scale = 1.2
+)
+dev.off()
+
+
+# ============================================================
+# Comparative dotplot - GO terms across cultivars (CAMERA)
+# ============================================================
+
+top_terms_per_cv <- lapply(names(sig_results), function(cv) {
+  res <- sig_results[[cv]]
+  if (nrow(res) == 0) return(NULL)
+  res_top <- head(res[order(res$FDR), ], 10)
+  res_top$cultivar <- cv
+  res_top
+})
+
+comparison_df <- do.call(rbind, top_terms_per_cv)
+
+if (is.null(comparison_df) || nrow(comparison_df) == 0) {
+
+  cat("No significant GO terms in either cultivar -- comparison plot skipped.\n")
+
+} else {
+
+  all_selected_terms <- unique(comparison_df$GOID)
+
+  full_comparison <- do.call(rbind, lapply(names(camera_results), function(cv) {
+    res <- camera_results[[cv]]
+    res_sub <- res[res$GOID %in% all_selected_terms, ]
+    if (nrow(res_sub) == 0) return(NULL)
+    res_sub$cultivar <- cv
+    res_sub
+  }))
+
+  term_labels <- unique(comparison_df[, c("GOID", "TERM")])
+  full_comparison <- merge(full_comparison, term_labels, by = "GOID", suffixes = c("", "_label"))
+
+  p_comparison <- ggplot(full_comparison, aes(x = cultivar, y = TERM_label, size = NGenes,
+                                               color = -log10(FDR), shape = Direction)) +
+    geom_point() +
+    scale_color_gradient(low = "#9B59B6", high = "#E67E22") +
+    scale_shape_manual(values = c(Up = 18, Down = 8)) +
+    guides(size = guide_legend(override.aes = list(shape = 8))) +
+    labs(title = "GO terms compared across cultivars (CAMERA)",
+         x = "Cultivar", y = "GO term", size = "Genes in set",
+         color = "-log10(FDR)", shape = "Direction") +
+    theme_bw()
+
+  print(p_comparison)
+  ggsave(paste0(outpathcount, "comparison_dotplot.pdf"), p_comparison, width = 9, height = 7)
+}
+
+
+# ============================================================
+# Significant GO terms summary
+# ============================================================
+
+for (cv in names(sig_results)) {
+
+  cat(
+    cv,
+    ":",
+    nrow(sig_results[[cv]]),
+    "GO terms with FDR < 0.05\n"
+  )
+}
+
+
+# DEGs MAPPING TO A GIVEN KEGG PATHWAY
+# ============================================================
+
+pathway_genes <- function(df, ko_id) {
+  df %>%
+    dplyr::filter(!is.na(KEGG_Pathway), KEGG_Pathway != "-") %>%
+    tidyr::separate_rows(KEGG_Pathway, sep = ",") %>%
+    dplyr::mutate(KEGG_Pathway = trimws(KEGG_Pathway)) %>%
+    dplyr::filter(KEGG_Pathway == ko_id) %>%
+    dplyr::select(Geneid, KO, log2FoldChange, padj, Description) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(desc(log2FoldChange))
+}
+
+
+# unique gene count (rows inflate when a gene carries several KOs)
+n_genes <- function(df, ko_id) {
+  length(unique(pathway_genes(df, ko_id)$Geneid))
+}
+
+
+for (ko in c("ko04626", "ko04016", "ko04075", "ko00270", "ko00195", "ko03010")) {
+  
+  cat("\n==============================\n")
+  cat(ko, "\n")
+  cat("==============================\n")
+  
+  cat("\nCatuai  — unique genes:", n_genes(kegg_color_Catuai, ko), "\n")
+  print(as.data.frame(pathway_genes(kegg_color_Catuai, ko)))
+  
+  cat("\nCR95    — unique genes:", n_genes(kegg_color_CR95, ko), "\n")
+  print(as.data.frame(pathway_genes(kegg_color_CR95, ko)))
+}
+for (ko in c("ko04626", "ko04016", "ko04075", "ko00270", "ko00195", "ko03010")) {
+  for (cv in c("Catuai", "CR95")) {
+    
+    df <- if (cv == "Catuai") kegg_color_Catuai else kegg_color_CR95
+    
+    write.table(
+      pathway_genes(df, ko),
+      file = file.path(outpathDE, paste0("DEGs_", ko, "_", cv, "_0.1.txt")),
+      sep = "\t",
+      quote = FALSE,
+      row.names = FALSE
+    )
+  }
+}
+##KEGG MAPPING
+if (!requireNamespace("pathview", quietly = TRUE)) BiocManager::install("pathview")
+library(pathview)
+
+ko_vector <- function(df) {
+  v <- df %>%
+    dplyr::distinct(Geneid, KO, log2FoldChange) %>%
+    dplyr::group_by(KO) %>%
+    dplyr::summarise(lfc = mean(log2FoldChange), .groups = "drop")
+  setNames(v$lfc, v$KO)
+}
+
+cat_v <- ko_vector(kegg_color_Catuai)
+cr_v  <- ko_vector(kegg_color_CR95)
+
+all_ko <- union(names(cat_v), names(cr_v))
+mat <- cbind(Catuai = cat_v[all_ko], CR95 = cr_v[all_ko])
+rownames(mat) <- all_ko          # keep NA for genes not DE in that cultivar
+
+setwd(outpathDE)                 # pathview writes to the working directory
+
+for (p in c("04626", "04016", "04075", "00270", "00195", "03010")) {
+  pathview(
+    gene.data    = mat,
+    pathway.id   = p,
+    species      = "ko",
+    gene.idtype  = "KEGG",
+    multi.state  = TRUE,
+    same.layer   = FALSE,
+    limit        = list(gene = 2.5),
+    bins         = list(gene = 10),
+    low  = list(gene = "blue"),
+    mid  = list(gene = "gray95"),
+    high = list(gene = "red"),
+    na.col       = "transparent",
+    out.suffix   = "Catuai_CR95",
+    kegg.native  = TRUE
+  )
+}
+#Heatmap para KEGG para comparar, que termino siendo como una verificación de los KEGG Color Pathways que no estaban del todo correctos
+# ============================================================
+# COMPARATIVE HEATMAPS (Catuai vs CR95) PER KEGG PATHWAY
+# ============================================================
+
+library(pheatmap)
+
+
+# ------------------------------------------------------------
+# PATHWAY TITLES
+# ------------------------------------------------------------
+
+pathway_titles <- c(
+  ko04626 = "Plant-pathogen interaction",
+  ko04016 = "MAPK signaling pathway - plant",
+  ko04075 = "Plant hormone signal transduction",
+  ko00270 = "Cysteine and methionine metabolism",
+  ko00195 = "Photosynthesis",
+  ko03010 = "Ribosome"
+)
+
+
+# ------------------------------------------------------------
+# SHORT GENE NAMES BY KO
+# Genes without a match keep the eggNOG description.
+# ------------------------------------------------------------
+
+short_names <- c(
+  K03781 = "Catalase",
+  K13447 = "Rboh (NADPH oxidase)",
+  K01183 = "Chitinase class I",
+  K20547 = "Chitinase class I",
+  K04730 = "LRR receptor-like kinase",
+  K04733 = "LRR receptor-like kinase",
+  K13420 = "LRR receptor-like kinase",
+  K13416 = "SERK-like kinase",
+  K02183 = "Calmodulin / CML",
+  K13448 = "Calmodulin-like (CML)",
+  K16465 = "Calmodulin-like (CML)",
+  K10840 = "Calmodulin-like (CML)",
+  K13412 = "Ca-dependent protein kinase",
+  K05391 = "Cyclic nucleotide-gated channel",
+  K13423 = "WRKY transcription factor",
+  K13424 = "WRKY transcription factor",
+  K13425 = "WRKY transcription factor",
+  K18835 = "WRKY transcription factor",
+  K13457 = "NB-LRR resistance protein",
+  K13459 = "NB-ARC resistance protein",
+  K14509 = "Ethylene receptor (ETR/ERS)",
+  K14484 = "Aux/IAA",
+  K14487 = "GH3 auxin-responsive",
+  K14506 = "GH3 / JAR1",
+  K14488 = "SAUR auxin-responsive",
+  K14489 = "Cytokinin receptor (CRE1)",
+  K14508 = "NPR1/NPR3-like",
+  K14504 = "Xyloglucan transferase (TCH4)",
+  K08235 = "Xyloglucan transferase (TCH4)",
+  K05933 = "ACC oxidase",
+  K00815 = "Tyrosine aminotransferase",
+  K01738 = "Cysteine synthase",
+  K00026 = "Malate dehydrogenase",
+  K17686 = "Copper-transporting ATPase",
+  K12619 = "5'-3' exoribonuclease",
+  K20553 = "5'-3' exoribonuclease",
+  K02639 = "Ferredoxin"
+)
+
+
+# ------------------------------------------------------------
+# GENES EXCLUDED FROM SPECIFIC PATHWAYS
+# KEGG ortholog assignment inconsistent with the NCBI
+# annotation of the Coffea arabica gene.
+# ------------------------------------------------------------
+
+exclude_genes <- list(
+  ko00195 = c("LOC113723029", "LOC113698731")   # ABC transporter B15
+)
+
+# ------------------------------------------------------------
+# HEATMAP FUNCTION
+# ------------------------------------------------------------
+
+comp_heatmap <- function(ko_id, file, use_short = TRUE, desc_chars = 70) {
+  
+  
+  g <- dplyr::bind_rows(
+    pathway_genes(kegg_color_Catuai, ko_id) %>%
+      dplyr::mutate(cultivar = "Catuai"),
+    
+    pathway_genes(kegg_color_CR95, ko_id) %>%
+      dplyr::mutate(cultivar = "CR95")
+  )
+  
+  
+  if (!is.null(exclude_genes[[ko_id]])) {
+    g <- g %>%
+      dplyr::filter(!Geneid %in% exclude_genes[[ko_id]])
+  }
+  
+  
+  if (nrow(g) == 0) {
+    message("No DEGs mapping to ", ko_id)
+    return(invisible(NULL))
+  }
+  
+  
+  lab <- g %>%
+    dplyr::mutate(short = unname(short_names[KO])) %>%
+    dplyr::group_by(Geneid) %>%
+    dplyr::summarise(
+      short       = dplyr::first(stats::na.omit(short)),
+      Description = dplyr::first(Description),
+      .groups     = "drop"
+    ) %>%
+    dplyr::mutate(
+      name = dplyr::case_when(
+        use_short & !is.na(short) ~ short,
+        TRUE ~ substr(Description, 1, desc_chars)
+      ),
+      label = paste0(Geneid, " - ", name)
+    )
+  
+  
+  m <- g %>%
+    dplyr::distinct(Geneid, cultivar, log2FoldChange) %>%
+    tidyr::pivot_wider(
+      names_from  = cultivar,
+      values_from = log2FoldChange
+    ) %>%
+    as.data.frame()
+  
+  rownames(m) <- lab$label[match(m$Geneid, lab$Geneid)]
+  
+  m <- as.matrix(m[, setdiff(colnames(m), "Geneid"), drop = FALSE])
+  
+  
+  for (cv in c("Catuai", "CR95")) {
+    if (!cv %in% colnames(m)) {
+      m <- cbind(m, NA_real_)
+      colnames(m)[ncol(m)] <- cv
+    }
+  }
+  
+  m <- m[, c("Catuai", "CR95"), drop = FALSE]
+  
+  
+  ord <- order(
+    !complete.cases(m),
+    -m[, "Catuai"],
+    -m[, "CR95"],
+    na.last = TRUE
+  )
+  
+  m <- m[ord, , drop = FALSE]
+  
+  
+  lim <- max(abs(m), na.rm = TRUE)
+  
+  
+  pheatmap(
+    m,
+    color        = colorRampPalette(c("blue", "white", "red"))(51),
+    breaks       = seq(-lim, lim, length.out = 52),
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    na_col       = "grey90",
+    border_color = "grey70",
+    fontsize_row = 8,
+    fontsize_col = 11,
+    angle_col    = 0,
+    labels_col   = c("Catuaí", "CR95"),
+    main         = ifelse(
+      is.na(pathway_titles[ko_id]),
+      ko_id,
+      paste0(pathway_titles[ko_id], " (", ko_id, ")")
+    ),
+    filename     = file,
+    width        = 11,
+    height       = max(6, 0.16 * nrow(m) + 2)
+  )
+  
+  invisible(m)
+}
+
+
+# ============================================================
+# GENERATE HEATMAPS
+# ============================================================
+
+for (ko in c("ko04626", "ko04016", "ko04075", "ko00270", "ko00195", "ko03010")) {
+  
+  comp_heatmap(
+    ko,
+    file.path(
+      outpathDE,
+      paste0("heatmap_", ko, "_Catuai_vs_CR95.pdf")
+    )
+  )
+}
+
+
+list.files(outpathDE, pattern = "^heatmap_")
+
+
