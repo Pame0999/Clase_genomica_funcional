@@ -94,7 +94,196 @@ annotation <- read.table(
   stringsAsFactors = FALSE,
   na.strings = c("-", "NA", "")
 )
+# ============================================================
+# PCA
+# ============================================================
 
+# PCA is performed on samples
+# Rows = samples
+# Columns = genes
+
+pca <- prcomp(
+  t(vst.mat),
+  scale. = TRUE
+)
+
+
+# ============================================================
+# PERCENTAGE OF VARIANCE
+# ============================================================
+
+barras <- 100 * (pca$sdev^2) / sum(pca$sdev^2)
+
+print(barras)
+
+barplot(
+  barras,
+  las = 2,
+  main = "Variance explained by each PC",
+  ylab = "Variance explained (%)"
+)
+
+
+# ============================================================
+# CREATE PCA DATA FRAME
+# ============================================================
+
+pca_data <- data.frame(
+  Sample = rownames(pca$x),
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  PC3 = pca$x[, 3],
+  cultivar = cultivar,
+  treatment = trt
+)
+
+print(pca_data)
+
+
+# ============================================================
+# PCA PLOT: PC1 vs PC2
+# ============================================================
+
+ggplot(
+  pca_data,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = treatment,
+    shape = cultivar,
+    label = Sample
+  )
+) +
+  geom_point(size = 4) +
+  geom_text(
+    vjust = -1,
+    size = 3
+  ) +
+  xlab(
+    paste0(
+      "PC1 (",
+      round(barras[1], 1),
+      "%)"
+    )
+  ) +
+  ylab(
+    paste0(
+      "PC2 (",
+      round(barras[2], 1),
+      "%)"
+    )
+  ) +
+  ggtitle("PCA Scores") +
+  theme_classic()
+
+
+# ============================================================
+# PCA PLOT WITHOUT SAMPLE NAMES
+# ============================================================
+
+ggplot(
+  pca_data,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = treatment,
+    shape = cultivar
+  )
+) +
+  geom_point(size = 5) +
+  xlab(
+    paste0(
+      "PC1 (",
+      round(barras[1], 1),
+      "%)"
+    )
+  ) +
+  ylab(
+    paste0(
+      "PC2 (",
+      round(barras[2], 1),
+      "%)"
+    )
+  ) +
+  ggtitle("PCA Scores") +
+  theme_classic()
+# ============================================================
+# PCA SCORES - SAMPLES
+# ============================================================
+
+pca_data <- data.frame(
+  Sample = rownames(pca$x),
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  PC3 = pca$x[, 3],
+  cultivar = cultivar,
+  treatment = trt
+)
+
+ggplot(
+  pca_data,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = treatment,
+    shape = cultivar,
+    label = Sample
+  )
+) +
+  geom_point(size = 4) +
+  geom_text(
+    vjust = -1,
+    size = 3
+  ) +
+  xlab(
+    paste0(
+      "PC1 (",
+      round(barras[1], 1),
+      "%)"
+    )
+  ) +
+  ylab(
+    paste0(
+      "PC2 (",
+      round(barras[2], 1),
+      "%)"
+    )
+  ) +
+  ggtitle("PCA Scores") +
+  theme_classic()
+# ============================================================
+# PCA LOADINGS - GENES
+# ============================================================
+
+loadings_data <- data.frame(
+  Gene = rownames(pca$rotation),
+  PC1 = pca$rotation[, 1],
+  PC2 = pca$rotation[, 2]
+)
+
+# Plot PC1 vs PC2 loadings
+plot(
+  loadings_data$PC1,
+  loadings_data$PC2,
+  type = "n",
+  main = "PCA Loadings",
+  xlab = paste0(
+    "PC1 (",
+    round(barras[1], 1),
+    "%)"
+  ),
+  ylab = paste0(
+    "PC2 (",
+    round(barras[2], 1),
+    "%)"
+  )
+)
+
+points(
+  loadings_data$PC1,
+  loadings_data$PC2,
+  pch = 16
+)
 
 # ============================================================
 # Create gene -> GO mapping
@@ -1294,5 +1483,24 @@ for (ko in c("ko04626", "ko04016", "ko04075", "ko00270", "ko00195", "ko03010")) 
 
 
 list.files(outpathDE, pattern = "^heatmap_")
+# ============================================================
+# MEME
+# ============================================================
 
+# ============================================================
+# TOMTOM
+# ============================================================
+
+cd "/Users/pame/r studio/reto/"
+
+# 1. Descargar base de datos de motivos de plantas (JASPAR CORE plants)
+curl -O https://jaspar.elixir.no/download/data/2024/CORE/JASPAR2024_CORE_plants_non-redundant_pfms_meme.txt
+
+# 2. Correr TOMTOM para Catuai
+tomtom -oc tomtom_out_Catuai meme_out/meme.txt JASPAR2024_CORE_plants_non-redundant_pfms_meme.txt
+
+# 3. Correr TOMTOM para CR95
+tomtom -oc tomtom_out_CR95 meme_out_CR95/meme.txt JASPAR2024_CORE_plants_non-redundant_pfms_meme.txt
+
+echo "Listo. Revisa tomtom_out_Catuai/tomtom.html y tomtom_out_CR95/tomtom.html"
 
