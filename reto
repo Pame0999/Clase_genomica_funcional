@@ -1486,7 +1486,84 @@ list.files(outpathDE, pattern = "^heatmap_")
 # ============================================================
 # MEME
 # ============================================================
+cd "/Users/pame/r studio/reto/"
+conda create -n genomics-tools -c bioconda -c conda-forge samtools bedtools meme -y
+conda activate genomics-tools
+cd "/Users/pame/r studio/reto/"
 
+GENOME="GCF_036785885.1_Coffea_Arabica_ET-39_HiFi_genomic.fna"
+GFF="genomic.gtf"
+###Para CATUAI
+# 1. Indexar genoma
+samtools faidx "$GENOME"
+cut -f1,2 "${GENOME}.fai" > genoma.sizes
+
+# 2. GTF -> BED, con gene_id limpio (LOC...)
+awk -F'\t' '$3 == "gene"' "$GFF" | \
+  awk -F'\t' 'BEGIN{OFS="\t"} {
+    split($9, a, "\"")
+    gid = a[2]
+    print $1, $4 - 1, $5, gid, ".", $7
+  }' > genes_all.bed
+
+echo "Genes totales en genes_all.bed:"
+wc -l genes_all.bed
+
+# 3. Lista de genes de interes limpia (sin encabezado "Gene")
+tail -n +2 SigGenes_Catuai.txt > genes_interes.txt
+echo "Genes en tu lista de interes:"
+wc -l genes_interes.txt
+
+# 4. Filtrar solo esos genes
+grep -w -F -f genes_interes.txt genes_all.bed > genes.bed
+echo "Genes de interes encontrados en el GTF:"
+wc -l genes.bed
+
+# 5. Regiones rio arriba (1000 pb, respetando hebra)
+bedtools flank -i genes.bed -g genoma.sizes -l 1000 -r 0 -s > upstream_1000bp.bed
+
+# 6. Extraer secuencias FASTA
+bedtools getfasta -fi "$GENOME" -bed upstream_1000bp.bed -s -name -fo upstream_1000bp.fasta
+echo "Secuencias extraidas:"
+grep -c '^>' upstream_1000bp.fasta
+
+# 7. Buscar motivos con MEME
+meme upstream_1000bp.fasta -dna -oc meme_out -nmotifs 5 -minw 6 -maxw 20
+
+echo "Listo. Revisa meme_out/meme.html"
+
+###Para CR95:
+cd "/Users/pame/r studio/reto/"
+
+GENOME="GCF_036785885.1_Coffea_Arabica_ET-39_HiFi_genomic.fna"
+GFF="genomic.gtf"
+
+# genes_all.bed y genoma.sizes ya existen de la corrida anterior,
+# no hace falta rehacerlos -- pero si quieres estar segura, no pasa
+# nada si los vuelves a correr, solo se sobrescriben igual.
+
+# 1. Lista de genes de interes para CR95 (sin encabezado "Gene")
+tail -n +2 SigGenes_CR95.txt > genes_interes_CR95.txt
+echo "Genes en tu lista de interes (CR95):"
+wc -l genes_interes_CR95.txt
+
+# 2. Filtrar solo esos genes
+grep -w -F -f genes_interes_CR95.txt genes_all.bed > genes_CR95.bed
+echo "Genes de interes encontrados en el GTF (CR95):"
+wc -l genes_CR95.bed
+
+# 3. Regiones rio arriba (1000 pb, respetando hebra)
+bedtools flank -i genes_CR95.bed -g genoma.sizes -l 1000 -r 0 -s > upstream_1000bp_CR95.bed
+
+# 4. Extraer secuencias FASTA
+bedtools getfasta -fi "$GENOME" -bed upstream_1000bp_CR95.bed -s -name -fo upstream_1000bp_CR95.fasta
+echo "Secuencias extraidas (CR95):"
+grep -c '^>' upstream_1000bp_CR95.fasta
+
+# 5. Buscar motivos con MEME (carpeta de salida distinta a la de Catuai)
+meme upstream_1000bp_CR95.fasta -dna -oc meme_out_CR95 -nmotifs 5 -minw 6 -maxw 20
+
+echo "Listo. Revisa meme_out_CR95/meme.html"
 # ============================================================
 # TOMTOM
 # ============================================================
