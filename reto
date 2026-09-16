@@ -1483,6 +1483,334 @@ for (ko in c("ko04626", "ko04016", "ko04075", "ko00270", "ko00195", "ko03010")) 
 
 
 list.files(outpathDE, pattern = "^heatmap_")
+
+# ============================================================
+# WGCNA
+# ============================================================
+ 
+options(stringsAsFactors = FALSE)
+enableWGCNAThreads()
+ 
+# FIX: wgcna_path ahora cuelga de outpath (antes era una ruta
+# relativa que guardaba todo fuera de tu carpeta de resultados)
+wgcna_path <- file.path(outpath, "WGCNA_results")
+dir.create(wgcna_path, showWarnings = FALSE, recursive = TRUE)
+ 
+network_path <- file.path(wgcna_path, "Network_plots")
+dir.create(network_path, showWarnings = FALSE)
+ 
+cyto_path <- file.path(wgcna_path, "Cytoscape_WGCNA")
+dir.create(cyto_path, showWarnings = FALSE)
+ 
+# ------------------------------------------------------------
+# Datos de expresion (VST)
+# ------------------------------------------------------------
+ 
+dds_wgcna <- DESeqDataSetFromMatrix(
+  countData = counts, colData = metadata, design = ~ cultivar + treatment
+)
+dds_wgcna <- estimateSizeFactors(dds_wgcna)
+vsd_wgcna <- vst(dds_wgcna, blind = TRUE)
+expr_mat <- assay(vsd_wgcna)
+ 
+datExpr <- t(expr_mat)   # filas = muestras, columnas = genes
+ 
+# Top 5000 genes mas variables
+ 
+gene_variance <- apply(datExpr, 2, var, na.rm = TRUE)
+top_n_genes <- min(5000, ncol(datExpr))
+top_genes <- names(sort(gene_variance, decreasing = TRUE)[1:top_n_genes])
+datExpr <- datExpr[, top_genes, drop = FALSE]
+ 
+cat("Genes utilizados:", ncol(datExpr), "\n")
+cat("Muestras utilizadas:", nrow(datExpr), "\n")
+ 
+# Control de calidad
+ 
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+if (!gsg$allOK) {
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes, drop = FALSE]
+}
+ 
+# Clustering de muestras
+ 
+sampleTree <- hclust(dist(datExpr), method = "average")
+ 
+pdf(file.path(wgcna_path, "WGCNA_sample_clustering.pdf"), width = 10, height = 7)
+plot(sampleTree, main = "WGCNA - Sample clustering", xlab = "", sub = "")
+dev.off()
+ 
+# ------------------------------------------------------------
+# FIX: alinear metadata con datExpr usando match(), no
+# indexar por rownames (metadata no tenia rownames = sample)
+# ------------------------------------------------------------
+ 
+metadata_wgcna <- metadata[
+  match(rownames(datExpr), metadata$sample),
+  , drop = FALSE
+]
+rownames(metadata_wgcna) <- metadata_wgcna$sample
+ 
+stopifnot(all(rownames(metadata_wgcna) == rownames(datExpr)))  # chequeo de seguridad
+ 
+traitData <- data.frame(
+  Xylella = as.numeric(metadata_wgcna$treatment == "xylella"),
+  Catuai = as.numeric(metadata_wgcna$cultivar == "Catuai"),
+  CR95 = as.numeric(metadata_wgcna$cultivar == "CR95")
+)
+traitData$Catuai_Xylella <- traitData$Catuai * traitData$Xylella
+traitData$CR95_Xylella <- traitData$CR95 * traitData$Xylella
+rownames(traitData) <- rownames(datExpr)
+ 
+# ------------------------------------------------------------
+# Soft-threshold
+# ------------------------------------------------------------
+ 
+powers <- c(1:10, seq(12, 20, 2))
+ 
+sft <- pickSoftThreshold(
+  datExpr, powerVector = powers, networkType = "unsigned", verbose = 5
+)
+ 
+pdf(file.path(wgcna_path, "WGCNA_soft_threshold.pdf"), width = 10, height = 7)
+par(mfrow = c(1, 2))
+plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     type = "n", xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit", main = "Scale independence")
+text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, cex = 0.8)
+abline(h = 0.85, lty = 2)
+plot(sft$fitIndices[, 1], sft$fitIndices[, 5], type = "n",
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
+     main = "Mean connectivity")
+text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, cex = 0.8)
+dev.off()
+ 
+r_sq_threshold <- 0.85
+candidates <- sft$fitIndices$Power[sft$fitIndices$SFT.R.sq >= r_sq_threshold]
+softPower <- if (length(candidates) > 0) min(candidates) else max(sft$fitIndices$Power)
+ 
+cat("Soft power seleccionado:", softPower, "\n")
+ 
+# ------------------------------------------------------------
+# Red (adjacency + TOM) y modulos
+# ------------------------------------------------------------
+ 
+adj <- adjacency(datExpr, power = softPower, type = "unsigned")
+TOM <- TOMsimilarity(adj, TOMType = "unsigned", verbose = 3)
+dissTOM <- 1 - TOM
+rm(adj); gc()
+ 
+geneTree <- hclust(as.dist(dissTOM), method = "average")
+ 
+pdf(file.path(wgcna_path, "WGCNA_gene_dendrogram.pdf"), width = 12, height = 8)
+plot(geneTree, main = "WGCNA Gene Clustering", xlab = "", sub = "")
+dev.off()
+ 
+dynamicMods <- cutreeDynamic(
+  dendro = geneTree, distM = dissTOM, deepSplit = 2,
+  pamRespectsDendro = FALSE, minClusterSize = 30
+)
+dynamicColors <- labels2colors(dynamicMods)
+ 
+merge <- mergeCloseModules(datExpr, dynamicColors, cutHeight = 0.25, verbose = 3)
+moduleColors <- merge$colors
+MEs <- merge$newMEs
+ 
+module_table <- data.frame(Gene = colnames(datExpr), Module = moduleColors)
+write.table(
+  module_table, file = file.path(wgcna_path, "WGCNA_gene_modules.txt"),
+  sep = "\t", quote = FALSE, row.names = FALSE
+)
+ 
+# ------------------------------------------------------------
+# Correlacion modulo-rasgo
+# ------------------------------------------------------------
+ 
+moduleTraitCor <- cor(MEs, traitData, use = "p")
+moduleTraitP <- corPvalueStudent(moduleTraitCor, nSamples = nrow(datExpr))
+ 
+textMatrix <- paste0(round(moduleTraitCor, 2), "\n(", signif(moduleTraitP, 2), ")")
+dim(textMatrix) <- dim(moduleTraitCor)
+ 
+pdf(file.path(wgcna_path, "WGCNA_module_trait_heatmap.pdf"), width = 10, height = 8)
+labeledHeatmap(
+  Matrix = moduleTraitCor, xLabels = colnames(moduleTraitCor),
+  yLabels = rownames(moduleTraitCor), ySymbols = rownames(moduleTraitCor),
+  colorLabels = FALSE, colors = blueWhiteRed(50), textMatrix = textMatrix,
+  setStdMargins = FALSE, cex.text = 0.7, zlim = c(-1, 1),
+  main = "Module-trait relationships"
+)
+dev.off()
+ 
+write.table(moduleTraitCor, file = file.path(wgcna_path, "WGCNA_module_trait_correlations.txt"), sep = "\t", quote = FALSE)
+write.table(moduleTraitP, file = file.path(wgcna_path, "WGCNA_module_trait_pvalues.txt"), sep = "\t", quote = FALSE)
+ 
+xylella_cor <- moduleTraitCor[, "Xylella", drop = FALSE]
+xylella_p <- moduleTraitP[, "Xylella", drop = FALSE]
+xylella_results <- data.frame(
+  Module = rownames(xylella_cor), Correlation = xylella_cor[, 1], Pvalue = xylella_p[, 1]
+)
+xylella_results <- xylella_results[order(xylella_results$Pvalue), , drop = FALSE]
+ 
+write.table(
+  xylella_results, file = file.path(wgcna_path, "WGCNA_Xylella_modules.txt"),
+  sep = "\t", quote = FALSE, row.names = FALSE
+)
+print(xylella_results)
+ 
+ 
+# ============================================================
+# GRAFICAS DE RED (nuevo)
+# ============================================================
+ 
+# Diagnostico: cuantos genes cayeron en cada modulo
+cat("\nDistribucion de modulos (incluye 'grey' = sin modulo):\n")
+print(table(moduleColors))
+ 
+modules <- unique(moduleColors)
+modules <- modules[modules != "grey"]   # grey = genes sin modulo asignado
+ 
+cat("\nModulos con los que se va a trabajar (sin 'grey'):", length(modules), "\n")
+print(modules)
+ 
+if (length(modules) == 0) {
+  warning(
+    "No se detectaron modulos distintos de 'grey'. ",
+    "No se generaran archivos de red ni de Cytoscape. ",
+    "Prueba bajando minClusterSize o revisando el softPower."
+  )
+}
+ 
+# ------------------------------------------------------------
+# Exportar a Cytoscape PRIMERO -- asi, aunque las graficas
+#      de abajo fallen, los archivos de nodos/edges ya quedaron
+#      guardados.
+# ------------------------------------------------------------
+ 
+threshold <- 0.10
+ 
+for (mod in modules) {
+ 
+  tryCatch({
+ 
+    genes_module <- colnames(datExpr)[moduleColors == mod]
+    mod_index <- which(moduleColors == mod)
+    TOM_module <- TOM[mod_index, mod_index]
+    dimnames(TOM_module) <- list(genes_module, genes_module)
+ 
+    exportNetworkToCytoscape(
+      TOM_module,
+      edgeFile = file.path(cyto_path, paste0("WGCNA_", mod, "_edges.txt")),
+      nodeFile = file.path(cyto_path, paste0("WGCNA_", mod, "_nodes.txt")),
+      weighted = TRUE,
+      threshold = threshold,
+      nodeNames = genes_module,
+      nodeAttr = rep(mod, length(genes_module))
+    )
+ 
+    cat("Cytoscape exportado para modulo:", mod, "->", cyto_path, "\n")
+ 
+  }, error = function(e) {
+    cat("ERROR exportando modulo", mod, ":", conditionMessage(e), "\n")
+  })
+}
+ 
+# ------------------------------------------------------------
+# Red de eigengenes: como se relacionan los modulos entre si
+# ------------------------------------------------------------
+ 
+tryCatch({
+  pdf(file.path(network_path, "WGCNA_eigengene_network.pdf"), width = 9, height = 9)
+  plotEigengeneNetworks(
+    MEs, "Eigengene network",
+    marDendro = c(0, 4, 1, 2),
+    marHeatmap = c(3, 4, 1, 2),
+    plotDendrograms = TRUE,
+    xLabelsAngle = 90
+  )
+  dev.off()
+}, error = function(e) {
+  if (dev.cur() > 1) dev.off()
+  cat("ERROR en eigengene network:", conditionMessage(e), "\n")
+})
+ 
+# ------------------------------------------------------------
+# Red de genes hub por modulo (grafo real, no solo texto)
+#      Usa la matriz TOM para dibujar los genes mas conectados
+#      de cada modulo con igraph.
+# ------------------------------------------------------------
+ 
+plot_module_network <- function(mod, top_n = 30, edge_threshold = 0.15) {
+ 
+  genes_module <- colnames(datExpr)[moduleColors == mod]
+  if (length(genes_module) < 3) return(invisible(NULL))
+ 
+  mod_index <- which(moduleColors == mod)
+  TOM_module <- TOM[mod_index, mod_index]
+  dimnames(TOM_module) <- list(genes_module, genes_module)
+ 
+  # conectividad intramodular -> elegir los genes hub
+  kIN <- rowSums(TOM_module) - 1
+  top_genes <- names(sort(kIN, decreasing = TRUE))[1:min(top_n, length(kIN))]
+ 
+  sub_TOM <- TOM_module[top_genes, top_genes]
+  sub_TOM[sub_TOM < edge_threshold] <- 0
+  diag(sub_TOM) <- 0
+ 
+  g <- graph_from_adjacency_matrix(sub_TOM, mode = "undirected", weighted = TRUE, diag = FALSE)
+  g <- delete_vertices(g, degree(g) == 0)
+ 
+  if (vcount(g) == 0) {
+    cat("Sin conexiones suficientes para graficar el modulo", mod, "\n")
+    return(invisible(NULL))
+  }
+ 
+  pdf(file.path(network_path, paste0("Network_", mod, ".pdf")), width = 8, height = 8)
+  plot(
+    g,
+    vertex.size = 6,
+    vertex.label.cex = 0.55,
+    vertex.color = mod,
+    vertex.label.color = "black",
+    edge.width = E(g)$weight * 4,
+    edge.color = adjustcolor("grey40", alpha.f = 0.6),
+    layout = layout_with_fr(g),
+    main = paste("Hub gene network -", mod)
+  )
+  dev.off()
+ 
+  cat("Red graficada para modulo", mod, "-", vcount(g), "genes,", ecount(g), "conexiones\n")
+}
+ 
+for (mod in modules) {
+  tryCatch(
+    plot_module_network(mod),
+    error = function(e) cat("ERROR graficando red de modulo", mod, ":", conditionMessage(e), "\n")
+  )
+}
+ 
+# ------------------------------------------------------------
+# Guardar objetos
+# ------------------------------------------------------------
+ 
+save(
+  datExpr, moduleColors, MEs, moduleTraitCor, moduleTraitP,
+  traitData, softPower, geneTree, TOM,
+  file = file.path(wgcna_path, "WGCNA_objects.RData")
+)
+ 
+cat("\n========================================\n")
+cat("ANALISIS TERMINADO\n")
+cat("========================================\n")
+cat("Genes WGCNA:", ncol(datExpr), "\n")
+cat("Muestras:", nrow(datExpr), "\n")
+cat("Soft power:", softPower, "\n")
+cat("Modulos (sin grey):", length(modules), "\n")
+cat("Resultados generales en:", outpath, "\n")
+cat("Resultados WGCNA en:", wgcna_path, "\n")
+cat("Graficas de red en:", network_path, "\n")
+cat("Cytoscape en:", cyto_path, "\n")
 # ============================================================
 # MEME
 # ============================================================
