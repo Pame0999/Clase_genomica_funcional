@@ -17,7 +17,6 @@ cran_pkgs <- c(
   "ggplot2",
   "BiocManager",
   "pheatmap",
-  "VennDiagram",
   "UpSetR"
 )
 
